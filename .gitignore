@@ -1,0 +1,30 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode and local build products
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM/
+
+# Generated macOS app bundles
+*.app
+
+# Local editor settings
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
