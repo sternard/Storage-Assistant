@@ -20,12 +20,15 @@ Storage Assistant is a recommendation-first macOS cleanup prototype. It scans us
 - Leftovers and services:
   - Library leftovers for apps that do not appear to be installed.
   - Saved application state, preferences, and exact bundle-ID Application Support folders.
+  - Hidden home app configuration folders such as `~/.hammerspoon`, plus stale `~/.config/<app>` folders, when no installed app name matches.
+  - Sandboxed app traces such as `~/Library/Containers`, `~/Library/Group Containers`, `~/Library/Application Scripts`, `~/Library/Preferences/ByHost`, `~/Library/WebKit`, `~/Library/HTTPStorages`, and `~/Library/Cookies`.
+  - Broader review-only traces in user and system Library locations, including Application Support, Preferences, Logs, Caches, plug-ins, Quick Look generators, Spotlight importers, preference panes, screen savers, privileged helpers, shared support folders, and package receipts.
   - Launch agents and launch daemons that point to missing programs or appear to be running without a matching installed app.
   - Known licensing/service leftovers such as PACE/iLok components.
 
 High-risk recommendations are review-only. Riskier systems such as Docker's disk image and simulator devices are surfaced so you can inspect them, not deleted directly.
 
-Launch agents, launch daemons, privileged helpers, and known licensing services are review-only. If a service appears to be running, unload it or use the vendor uninstaller before removing files manually.
+Launch agents, launch daemons, privileged helpers, known licensing services, home app configuration folders, containers, plug-ins, shared support, package receipts, and system-wide traces are review-only. If a service appears to be running, unload it or use the vendor uninstaller before removing files manually.
 
 ## Run the CLI
 
@@ -83,7 +86,7 @@ swift test
 
 - No background deletion.
 - No permanent deletion.
-- No scanning of `/System`, `/private`, `/bin`, `/sbin`, or system Library locations.
+- No scanning of `/System`, `/private`, `/bin`, or `/sbin`. System-wide `/Library`, `/Users/Shared`, and package receipt traces are surfaced as review-only.
 - Risky developer artifacts are marked review-only when direct deletion would be unsafe.
 - Running services, launch daemons, and privileged helper tools are review-only.
 - Ignore rules and cleanup history are saved locally in `~/Library/Application Support/Storage Assistant/state.json`.

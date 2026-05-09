@@ -79,6 +79,21 @@ struct InstalledAppInventory {
         return normalizedNames.contains(normalized) || executableNames.contains(normalized)
     }
 
+    func containsRelatedNameLike(_ name: String) -> Bool {
+        let normalized = normalizedAppToken(name)
+        guard normalized.count >= 4 else { return false }
+
+        if containsNameLike(name) {
+            return true
+        }
+
+        return normalizedNames.contains { installed in
+            installed.contains(normalized) || normalized.contains(installed)
+        } || executableNames.contains { installed in
+            installed.contains(normalized) || normalized.contains(installed)
+        }
+    }
+
     private static func collectApps(
         under root: URL,
         maxDepth: Int,

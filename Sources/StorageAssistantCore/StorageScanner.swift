@@ -17,6 +17,7 @@ public struct ScannerConfig: Hashable, Sendable {
     public var installedAppSearchRoots: [URL]?
     public var includeRunningApplicationsInAppInventory: Bool
     public var includeRunningProcessScan: Bool
+    public var includeSystemAppTraceScan: Bool
     public var developerSearchRoots: [URL]?
 
     public static let `default` = ScannerConfig(
@@ -36,6 +37,7 @@ public struct ScannerConfig: Hashable, Sendable {
         installedAppSearchRoots: nil,
         includeRunningApplicationsInAppInventory: true,
         includeRunningProcessScan: true,
+        includeSystemAppTraceScan: true,
         developerSearchRoots: nil
     )
 
@@ -56,6 +58,7 @@ public struct ScannerConfig: Hashable, Sendable {
         installedAppSearchRoots: [URL]? = nil,
         includeRunningApplicationsInAppInventory: Bool = true,
         includeRunningProcessScan: Bool = true,
+        includeSystemAppTraceScan: Bool = true,
         developerSearchRoots: [URL]? = nil
     ) {
         self.minimumDownloadBytes = minimumDownloadBytes
@@ -74,6 +77,7 @@ public struct ScannerConfig: Hashable, Sendable {
         self.installedAppSearchRoots = installedAppSearchRoots
         self.includeRunningApplicationsInAppInventory = includeRunningApplicationsInAppInventory
         self.includeRunningProcessScan = includeRunningProcessScan
+        self.includeSystemAppTraceScan = includeSystemAppTraceScan
         self.developerSearchRoots = developerSearchRoots
     }
 }
@@ -911,6 +915,14 @@ public final class StorageScanner {
         var recommendations = scanLibraryLeftovers(installedApps: inventory)
         guard !isCancelled else { return recommendations }
 
+        report("Checking app configuration leftovers")
+        recommendations += scanHomeConfigurationLeftovers(installedApps: inventory)
+        guard !isCancelled else { return recommendations }
+
+        report("Checking extended app trace leftovers")
+        recommendations += scanAppTraceLeftovers(installedApps: inventory)
+        guard !isCancelled else { return recommendations }
+
         report("Checking running processes")
         let runningProcesses = config.includeRunningProcessScan
             ? RunningProcessInventory.load()
@@ -930,6 +942,515 @@ public final class StorageScanner {
         )
 
         return recommendations
+    }
+
+    private struct HomeConfigurationLeftoverLocation {
+        let directory: URL
+        let label: String
+        let scansHiddenChildren: Bool
+        let minimumBytes: Int64
+        let confidence: ConfidenceLevel
+    }
+
+    private enum AppTraceIdentityStyle {
+        case standard
+        case byHostPreference
+        case groupContainer
+        case cookie
+        case packageReceipt
+    }
+
+    private enum AppTraceItemKind {
+        case files
+        case directories
+        case filesAndDirectories
+
+        func includes(_ metadata: FileMetadata) -> Bool {
+            switch self {
+            case .files:
+                return !metadata.isDirectory
+            case .directories:
+                return metadata.isDirectory
+            case .filesAndDirectories:
+                return true
+            }
+        }
+    }
+
+    private enum AppTraceTraversal {
+        case immediateChildren
+        case childrenOfImmediateDirectories
+    }
+
+    private struct AppTraceLeftoverLocation {
+        let directory: URL
+        let label: String
+        let risk: RiskLevel
+        let confidence: ConfidenceLevel
+        let minimumBytes: Int64
+        let requiresStaleDate: Bool
+        let itemKind: AppTraceItemKind
+        let traversal: AppTraceTraversal
+        let identityStyle: AppTraceIdentityStyle
+        let allowedExtensions: Set<String>?
+        let usesRelatedNameMatch: Bool
+        let detail: String
+
+        init(
+            directory: URL,
+            label: String,
+            risk: RiskLevel,
+            confidence: ConfidenceLevel,
+            minimumBytes: Int64,
+            requiresStaleDate: Bool = true,
+            itemKind: AppTraceItemKind = .filesAndDirectories,
+            traversal: AppTraceTraversal = .immediateChildren,
+            identityStyle: AppTraceIdentityStyle = .standard,
+            allowedExtensions: Set<String>? = nil,
+            usesRelatedNameMatch: Bool = false,
+            detail: String
+        ) {
+            self.directory = directory
+            self.label = label
+            self.risk = risk
+            self.confidence = confidence
+            self.minimumBytes = minimumBytes
+            self.requiresStaleDate = requiresStaleDate
+            self.itemKind = itemKind
+            self.traversal = traversal
+            self.identityStyle = identityStyle
+            self.allowedExtensions = allowedExtensions
+            self.usesRelatedNameMatch = usesRelatedNameMatch
+            self.detail = detail
+        }
+    }
+
+    private func scanHomeConfigurationLeftovers(installedApps: InstalledAppInventory) -> [Recommendation] {
+        let locations = [
+            HomeConfigurationLeftoverLocation(
+                directory: homeDirectory,
+                label: "home configuration folder",
+                scansHiddenChildren: true,
+                minimumBytes: 1,
+                confidence: .medium
+            ),
+            HomeConfigurationLeftoverLocation(
+                directory: homeDirectory.appendingPathComponent(".config", isDirectory: true),
+                label: "configuration folder",
+                scansHiddenChildren: false,
+                minimumBytes: config.minimumLeftoverBytes,
+                confidence: .low
+            )
+        ]
+
+        var recommendations: [Recommendation] = []
+
+        for location in locations {
+            guard !isCancelled else { return recommendations }
+            guard fileManager.storageAssistantFileExists(at: location.directory) else {
+                continue
+            }
+
+            for url in immediateChildren(of: location.directory) {
+                guard !isCancelled else { return recommendations }
+                guard
+                    let metadata = fileManager.storageAssistantMetadata(for: url),
+                    metadata.isDirectory,
+                    !metadata.isSymbolicLink,
+                    !isProtectedLeftoverPath(url)
+                else {
+                    continue
+                }
+
+                if location.scansHiddenChildren && !url.lastPathComponent.hasPrefix(".") {
+                    continue
+                }
+
+                guard !isProtectedHomeConfigurationName(url.lastPathComponent) else {
+                    continue
+                }
+
+                let identity = homeConfigurationIdentity(for: url)
+                guard shouldFlagLeftover(identity: identity, url: url, installedApps: installedApps) else {
+                    continue
+                }
+
+                let size = itemSize(url, metadata: metadata)
+                guard size >= location.minimumBytes else {
+                    continue
+                }
+
+                let ageDate = metadata.modifiedDate ?? metadata.createdDate
+                let ageDays = StorageFormatting.daysSince(ageDate, now: now)
+                guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
+                    continue
+                }
+
+                recommendations.append(
+                    recommendation(
+                        url: url,
+                        metadata: metadata,
+                        displayName: "\(identity) \(location.label)",
+                        category: .leftovers,
+                        risk: .medium,
+                        confidence: location.confidence,
+                        sizeBytes: size,
+                        reason: "\(location.label.capitalized), \(StorageFormatting.bytes(size)), but no installed app match was found.",
+                        detail: "App configuration folders can contain hand-written settings or scripts. Review the contents before removing them.",
+                        defaultAction: .revealOnly
+                    )
+                )
+            }
+        }
+
+        return recommendations
+    }
+
+    private func scanAppTraceLeftovers(installedApps: InstalledAppInventory) -> [Recommendation] {
+        let appSupportMinimum = max(config.minimumLeftoverBytes, 100 * 1_024 * 1_024)
+        let preferenceMinimum = min(config.minimumLeftoverBytes, 64 * 1_024)
+        let pluginMinimum = min(config.minimumLeftoverBytes, 1 * 1_024 * 1_024)
+        let userLibrary = homeDirectory.appendingPathComponent("Library", isDirectory: true)
+
+        var locations: [AppTraceLeftoverLocation] = [
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Containers", isDirectory: true),
+                label: "app container",
+                risk: .medium,
+                confidence: .medium,
+                minimumBytes: config.minimumLeftoverBytes,
+                itemKind: .directories,
+                detail: "App containers can hold documents, databases, and sandboxed app state. Review the contents before removing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Group Containers", isDirectory: true),
+                label: "group container",
+                risk: .medium,
+                confidence: .low,
+                minimumBytes: config.minimumLeftoverBytes,
+                itemKind: .directories,
+                identityStyle: .groupContainer,
+                detail: "Group containers can be shared by multiple apps from the same developer. Review carefully before changing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Application Scripts", isDirectory: true),
+                label: "application scripts folder",
+                risk: .medium,
+                confidence: .medium,
+                minimumBytes: 1,
+                itemKind: .directories,
+                detail: "Application Scripts folders may contain user-created automation. Review the scripts before removing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Preferences/ByHost", isDirectory: true),
+                label: "ByHost preference file",
+                risk: .medium,
+                confidence: .medium,
+                minimumBytes: preferenceMinimum,
+                itemKind: .files,
+                identityStyle: .byHostPreference,
+                allowedExtensions: ["plist"],
+                detail: "ByHost preferences are per-Mac settings. They are usually small, but review them when the owning app is gone."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("WebKit", isDirectory: true),
+                label: "WebKit storage",
+                risk: .medium,
+                confidence: .medium,
+                minimumBytes: config.minimumLeftoverBytes,
+                detail: "WebKit storage can include local web data for an app. Review before removing it."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("HTTPStorages", isDirectory: true),
+                label: "HTTP storage",
+                risk: .medium,
+                confidence: .medium,
+                minimumBytes: config.minimumLeftoverBytes,
+                detail: "HTTP storage can include cached responses or session data for an app. Review before removing it."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Cookies", isDirectory: true),
+                label: "cookie storage",
+                risk: .medium,
+                confidence: .low,
+                minimumBytes: 1,
+                itemKind: .files,
+                identityStyle: .cookie,
+                allowedExtensions: ["binarycookies", "cookies"],
+                detail: "Cookie files can hold login/session data. Review before removing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: userLibrary.appendingPathComponent("Application Support", isDirectory: true),
+                label: "application support folder",
+                risk: .medium,
+                confidence: .low,
+                minimumBytes: config.minimumLeftoverBytes,
+                itemKind: .directories,
+                usesRelatedNameMatch: true,
+                detail: "Application Support can contain user data, templates, databases, or licensed assets. Review the folder before removing it."
+            )
+        ]
+
+        locations += pluginTraceLocations(
+            baseDirectory: userLibrary,
+            risk: .medium,
+            minimumBytes: pluginMinimum
+        )
+
+        if config.includeSystemAppTraceScan {
+            locations += systemAppTraceLocations(
+                appSupportMinimum: appSupportMinimum,
+                preferenceMinimum: preferenceMinimum,
+                pluginMinimum: pluginMinimum
+            )
+        }
+
+        var recommendations: [Recommendation] = []
+
+        for location in locations {
+            guard !isCancelled else { return recommendations }
+            guard fileManager.storageAssistantFileExists(at: location.directory) else {
+                continue
+            }
+
+            for url in appTraceCandidates(for: location) {
+                guard !isCancelled else { return recommendations }
+                guard
+                    let metadata = fileManager.storageAssistantMetadata(for: url),
+                    !metadata.isSymbolicLink,
+                    location.itemKind.includes(metadata),
+                    !isProtectedLeftoverPath(url)
+                else {
+                    continue
+                }
+
+                if let allowedExtensions = location.allowedExtensions,
+                   !allowedExtensions.contains(url.pathExtension.lowercased()) {
+                    continue
+                }
+
+                guard
+                    let identity = appTraceIdentity(for: url, style: location.identityStyle),
+                    !identity.isEmpty
+                else {
+                    continue
+                }
+
+                if location.usesRelatedNameMatch,
+                   !isBundleIdentifierCandidate(identity),
+                   installedApps.containsRelatedNameLike(identity) {
+                    continue
+                }
+
+                guard shouldFlagLeftover(identity: identity, url: url, installedApps: installedApps) else {
+                    continue
+                }
+
+                let size = itemSize(url, metadata: metadata)
+                guard size >= location.minimumBytes else {
+                    continue
+                }
+
+                if location.requiresStaleDate {
+                    let ageDate = metadata.modifiedDate ?? metadata.createdDate
+                    let ageDays = StorageFormatting.daysSince(ageDate, now: now)
+                    guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
+                        continue
+                    }
+                }
+
+                recommendations.append(
+                    recommendation(
+                        url: url,
+                        metadata: metadata,
+                        displayName: "\(identity) \(location.label)",
+                        category: .leftovers,
+                        risk: location.risk,
+                        confidence: location.confidence,
+                        sizeBytes: size,
+                        reason: "\(location.label.capitalized), \(StorageFormatting.bytes(size)), but no installed app match was found.",
+                        detail: location.detail,
+                        defaultAction: .revealOnly
+                    )
+                )
+            }
+        }
+
+        return recommendations
+    }
+
+    private func pluginTraceLocations(
+        baseDirectory: URL,
+        risk: RiskLevel,
+        minimumBytes: Int64
+    ) -> [AppTraceLeftoverLocation] {
+        let pluginDetail = "Plug-ins, preference panes, screen savers, and importers can affect other apps or the system. Review before removing them."
+
+        return [
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("Audio/Plug-Ins", isDirectory: true),
+                label: "audio plug-in",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                traversal: .childrenOfImmediateDirectories,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("Internet Plug-Ins", isDirectory: true),
+                label: "internet plug-in",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("QuickLook", isDirectory: true),
+                label: "Quick Look plug-in",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("Spotlight", isDirectory: true),
+                label: "Spotlight importer",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("PreferencePanes", isDirectory: true),
+                label: "preference pane",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: baseDirectory.appendingPathComponent("Screen Savers", isDirectory: true),
+                label: "screen saver",
+                risk: risk,
+                confidence: .low,
+                minimumBytes: minimumBytes,
+                usesRelatedNameMatch: true,
+                detail: pluginDetail
+            )
+        ]
+    }
+
+    private func systemAppTraceLocations(
+        appSupportMinimum: Int64,
+        preferenceMinimum: Int64,
+        pluginMinimum: Int64
+    ) -> [AppTraceLeftoverLocation] {
+        let systemLibrary = URL(fileURLWithPath: "/Library", isDirectory: true)
+        let systemDetail = "This is a system-wide app trace. It may affect every user on this Mac, so review it rather than deleting directly."
+
+        var locations = [
+            AppTraceLeftoverLocation(
+                directory: systemLibrary.appendingPathComponent("Application Support", isDirectory: true),
+                label: "system application support folder",
+                risk: .high,
+                confidence: .low,
+                minimumBytes: appSupportMinimum,
+                itemKind: .directories,
+                usesRelatedNameMatch: true,
+                detail: systemDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: systemLibrary.appendingPathComponent("Preferences", isDirectory: true),
+                label: "system preference file",
+                risk: .high,
+                confidence: .medium,
+                minimumBytes: preferenceMinimum,
+                itemKind: .files,
+                allowedExtensions: ["plist"],
+                detail: systemDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: systemLibrary.appendingPathComponent("Logs", isDirectory: true),
+                label: "system log folder",
+                risk: .high,
+                confidence: .low,
+                minimumBytes: config.minimumLogBytes,
+                usesRelatedNameMatch: true,
+                detail: systemDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: systemLibrary.appendingPathComponent("Caches", isDirectory: true),
+                label: "system cache folder",
+                risk: .high,
+                confidence: .low,
+                minimumBytes: config.minimumCacheBytes,
+                usesRelatedNameMatch: true,
+                detail: systemDetail
+            ),
+            AppTraceLeftoverLocation(
+                directory: systemLibrary.appendingPathComponent("PrivilegedHelperTools", isDirectory: true),
+                label: "privileged helper",
+                risk: .high,
+                confidence: .medium,
+                minimumBytes: 1,
+                itemKind: .files,
+                detail: "Privileged helpers can run with elevated permissions. Use the vendor uninstaller or inspect carefully before removing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: URL(fileURLWithPath: "/Users/Shared", isDirectory: true),
+                label: "shared app support folder",
+                risk: .high,
+                confidence: .low,
+                minimumBytes: appSupportMinimum,
+                itemKind: .directories,
+                usesRelatedNameMatch: true,
+                detail: "Shared folders can contain assets, libraries, licenses, or data used by multiple user accounts. Review before removing them."
+            ),
+            AppTraceLeftoverLocation(
+                directory: URL(fileURLWithPath: "/var/db/receipts", isDirectory: true),
+                label: "package receipt",
+                risk: .high,
+                confidence: .low,
+                minimumBytes: 1,
+                requiresStaleDate: false,
+                itemKind: .files,
+                identityStyle: .packageReceipt,
+                allowedExtensions: ["plist"],
+                detail: "Package receipts are tiny install records. They are useful evidence of old software, but should be treated as review-only."
+            )
+        ]
+
+        locations += pluginTraceLocations(
+            baseDirectory: systemLibrary,
+            risk: .high,
+            minimumBytes: pluginMinimum
+        )
+
+        return locations
+    }
+
+    private func appTraceCandidates(for location: AppTraceLeftoverLocation) -> [URL] {
+        switch location.traversal {
+        case .immediateChildren:
+            return immediateChildren(of: location.directory)
+        case .childrenOfImmediateDirectories:
+            return immediateChildren(of: location.directory).flatMap { child -> [URL] in
+                guard
+                    let metadata = fileManager.storageAssistantMetadata(for: child),
+                    metadata.isDirectory,
+                    !metadata.isSymbolicLink
+                else {
+                    return []
+                }
+
+                return immediateChildren(of: child)
+            }
+        }
     }
 
     private func scanLibraryLeftovers(installedApps: InstalledAppInventory) -> [Recommendation] {
@@ -1183,6 +1704,91 @@ public final class StorageScanner {
         return url.deletingPathExtension().lastPathComponent
     }
 
+    private func homeConfigurationIdentity(for url: URL) -> String {
+        let name = url.lastPathComponent
+
+        if name.hasPrefix(".") {
+            return String(name.dropFirst())
+        }
+
+        return name
+    }
+
+    private func appTraceIdentity(for url: URL, style: AppTraceIdentityStyle) -> String? {
+        switch style {
+        case .standard:
+            return leftoverIdentity(for: url)
+        case .byHostPreference:
+            return byHostPreferenceIdentity(for: url)
+        case .groupContainer:
+            return groupContainerIdentity(for: url)
+        case .cookie:
+            return cookieIdentity(for: url)
+        case .packageReceipt:
+            return packageReceiptIdentity(for: url)
+        }
+    }
+
+    private func byHostPreferenceIdentity(for url: URL) -> String? {
+        let name = url.deletingPathExtension().lastPathComponent
+        let parts = name.split(separator: ".").map(String.init)
+        guard parts.count > 1 else { return name }
+
+        let hostPart = parts.last ?? ""
+        let hostCharacters = CharacterSet(charactersIn: "0123456789abcdefABCDEF-")
+        if hostPart.count >= 8,
+           hostPart.rangeOfCharacter(from: hostCharacters.inverted) == nil {
+            return parts.dropLast().joined(separator: ".")
+        }
+
+        return name
+    }
+
+    private func groupContainerIdentity(for url: URL) -> String? {
+        let name = url.lastPathComponent
+        if name.hasPrefix("group.") {
+            return String(name.dropFirst("group.".count))
+        }
+
+        let parts = name.split(separator: ".", maxSplits: 1).map(String.init)
+        if parts.count == 2, isLikelyTeamIdentifier(parts[0]) {
+            return parts[1]
+        }
+
+        return name
+    }
+
+    private func cookieIdentity(for url: URL) -> String? {
+        let name = url.lastPathComponent
+        let lowercased = name.lowercased()
+
+        if lowercased == "cookies.binarycookies" || lowercased == "cookies.cookies" {
+            return nil
+        }
+
+        if lowercased.hasSuffix(".binarycookies") {
+            return String(name.dropLast(".binarycookies".count))
+        }
+
+        if lowercased.hasSuffix(".cookies") {
+            return String(name.dropLast(".cookies".count))
+        }
+
+        return url.deletingPathExtension().lastPathComponent
+    }
+
+    private func packageReceiptIdentity(for url: URL) -> String? {
+        let name = url.deletingPathExtension().lastPathComponent
+        guard !name.isEmpty else { return nil }
+        return name
+    }
+
+    private func isLikelyTeamIdentifier(_ text: String) -> Bool {
+        guard text.count == 10 else { return false }
+        let allowedCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        return text.rangeOfCharacter(from: allowedCharacters.inverted) == nil
+    }
+
     private func shouldFlagLeftover(
         identity: String,
         url: URL,
@@ -1235,6 +1841,7 @@ public final class StorageScanner {
 
         let protectedNames: Set<String> = [
             "addressbook",
+            "apple",
             "callhistorydb",
             "cloudDocs".lowercased(),
             "com.apple.tcc",
@@ -1251,6 +1858,56 @@ public final class StorageScanner {
             lowercasedName.hasPrefix("com.apple.") ||
             lowercasedName.hasPrefix("group.com.apple.") ||
             lowercasedName.hasPrefix("systemgroup.com.apple.")
+    }
+
+    private func isProtectedHomeConfigurationName(_ name: String) -> Bool {
+        let lowercased = name.lowercased()
+        let protectedPrefixes = [
+            ".bash",
+            ".zsh",
+            ".profile"
+        ]
+        let protectedNames: Set<String> = [
+            ".android",
+            ".ansible",
+            ".asdf",
+            ".aws",
+            ".azure",
+            ".cache",
+            ".cargo",
+            ".codex",
+            ".config",
+            ".cups",
+            ".docker",
+            ".gem",
+            ".git",
+            ".gitconfig",
+            ".gnupg",
+            ".gradle",
+            ".kube",
+            ".lesshst",
+            ".local",
+            ".m2",
+            ".npm",
+            ".nvm",
+            ".ollama",
+            ".pub-cache",
+            ".pyenv",
+            ".rbenv",
+            ".rustup",
+            ".sdkman",
+            ".ssh",
+            ".swiftpm",
+            ".terraform.d",
+            ".trash",
+            "git",
+            "gnupg",
+            "ssh",
+            "zsh"
+        ]
+
+        return protectedNames.contains(lowercased) ||
+            protectedPrefixes.contains { lowercased.hasPrefix($0) }
     }
 
     private func knownLeftoverSignature(matching text: String) -> KnownLeftoverSignature? {

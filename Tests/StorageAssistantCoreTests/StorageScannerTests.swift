@@ -136,6 +136,183 @@ final class StorageScannerTests: XCTestCase {
         )
     }
 
+    func testFlagsAppContainerForUninstalledApp() throws {
+        let container = temporaryRoot
+            .appendingPathComponent("Library/Containers/com.example.Gone", isDirectory: true)
+        try writeFile(at: container.appendingPathComponent("Data/state.db"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, container.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.confidence, .medium)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
+    func testDoesNotFlagAppContainerForInstalledBundleIdentifier() throws {
+        let app = temporaryRoot.appendingPathComponent("Applications/Installed.app", isDirectory: true)
+        try createAppBundle(
+            at: app,
+            bundleIdentifier: "com.example.Installed",
+            name: "Installed"
+        )
+
+        let container = temporaryRoot
+            .appendingPathComponent("Library/Containers/com.example.Installed", isDirectory: true)
+        try writeFile(at: container.appendingPathComponent("Data/state.db"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, container.path) && $0.category == .leftovers
+            }
+        )
+    }
+
+    func testFlagsByHostPreferenceForUninstalledApp() throws {
+        let preference = temporaryRoot
+            .appendingPathComponent("Library/Preferences/ByHost/com.example.Gone.A1B2C3D4-E5F6.plist")
+        try writeFile(at: preference, byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, preference.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.confidence, .medium)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
+    func testFlagsHumanReadableApplicationSupportFolderForUninstalledApp() throws {
+        let appSupport = temporaryRoot
+            .appendingPathComponent("Library/Application Support/Old Drawing App", isDirectory: true)
+        try writeFile(at: appSupport.appendingPathComponent("Library.db"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, appSupport.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.confidence, .low)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
+    func testFlagsHiddenConfigurationFolderForUninstalledApp() throws {
+        let hammerspoonConfig = temporaryRoot
+            .appendingPathComponent(".hammerspoon", isDirectory: true)
+        try writeFile(at: hammerspoonConfig.appendingPathComponent("init.lua"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, hammerspoonConfig.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.risk, .medium)
+        XCTAssertEqual(recommendation.confidence, .medium)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
+    func testDoesNotFlagHiddenConfigurationFolderForInstalledAppName() throws {
+        let app = temporaryRoot.appendingPathComponent("Applications/Hammerspoon.app", isDirectory: true)
+        try createAppBundle(
+            at: app,
+            bundleIdentifier: "org.hammerspoon.Hammerspoon",
+            name: "Hammerspoon"
+        )
+
+        let hammerspoonConfig = temporaryRoot
+            .appendingPathComponent(".hammerspoon", isDirectory: true)
+        try writeFile(at: hammerspoonConfig.appendingPathComponent("init.lua"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, hammerspoonConfig.path) && $0.category == .leftovers
+            }
+        )
+    }
+
+    func testFlagsConfigFolderForUninstalledApp() throws {
+        let configFolder = temporaryRoot
+            .appendingPathComponent(".config/Rectangle", isDirectory: true)
+        try writeFile(at: configFolder.appendingPathComponent("settings.json"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, configFolder.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.confidence, .low)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
     func testFlagsDeadLaunchAgent() throws {
         let launchAgent = temporaryRoot
             .appendingPathComponent("Library/LaunchAgents/com.example.Gone.helper.plist")
@@ -211,7 +388,8 @@ final class StorageScannerTests: XCTestCase {
             leftoverStaleDays: 0,
             enableAppLeftoverScan: false,
             includeRunningApplicationsInAppInventory: false,
-            includeRunningProcessScan: false
+            includeRunningProcessScan: false,
+            includeSystemAppTraceScan: false
         )
     }
 
