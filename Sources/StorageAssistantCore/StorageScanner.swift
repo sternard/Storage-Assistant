@@ -18,6 +18,7 @@ public struct ScannerConfig: Hashable, Sendable {
     public var includeRunningApplicationsInAppInventory: Bool
     public var includeRunningProcessScan: Bool
     public var includeSystemAppTraceScan: Bool
+    public var enableSystemDataBreakdown: Bool
     public var developerSearchRoots: [URL]?
 
     public static let `default` = ScannerConfig(
@@ -38,6 +39,7 @@ public struct ScannerConfig: Hashable, Sendable {
         includeRunningApplicationsInAppInventory: true,
         includeRunningProcessScan: true,
         includeSystemAppTraceScan: true,
+        enableSystemDataBreakdown: true,
         developerSearchRoots: nil
     )
 
@@ -59,6 +61,7 @@ public struct ScannerConfig: Hashable, Sendable {
         includeRunningApplicationsInAppInventory: Bool = true,
         includeRunningProcessScan: Bool = true,
         includeSystemAppTraceScan: Bool = true,
+        enableSystemDataBreakdown: Bool = true,
         developerSearchRoots: [URL]? = nil
     ) {
         self.minimumDownloadBytes = minimumDownloadBytes
@@ -78,6 +81,7 @@ public struct ScannerConfig: Hashable, Sendable {
         self.includeRunningApplicationsInAppInventory = includeRunningApplicationsInAppInventory
         self.includeRunningProcessScan = includeRunningProcessScan
         self.includeSystemAppTraceScan = includeSystemAppTraceScan
+        self.enableSystemDataBreakdown = enableSystemDataBreakdown
         self.developerSearchRoots = developerSearchRoots
     }
 }
@@ -90,6 +94,30 @@ public final class StorageScanner {
         var buildArtifacts: Set<URL> = []
     }
 
+    private struct SystemDataCandidate {
+        let url: URL
+        let title: String
+        let category: SystemDataCategory
+        let detail: String
+    }
+
+    private struct SystemDataMeasurement {
+        let sizeBytes: Int64
+        let contributors: [SystemDataContributor]
+        let staleItems: [SystemDataStaleItem]
+    }
+
+    private struct LocalSnapshotSummary {
+        let count: Int
+        let totalBytes: Int64?
+        let names: [String]
+    }
+
+    private struct DirectoryMeasurement {
+        let allocatedSize: Int64
+        let latestActivityDate: Date?
+    }
+
     private let fileManager: FileManager
     private let homeDirectory: URL
     private let config: ScannerConfig
@@ -97,6 +125,7 @@ public final class StorageScanner {
     private let progressHandler: (@Sendable (ScanProgress) -> Void)?
     private let shouldCancel: @Sendable () -> Bool
     private var diagnostics: [PermissionDiagnostic] = []
+    private var directoryMeasurementCache: [String: DirectoryMeasurement] = [:]
 
     public init(
         fileManager: FileManager = .default,
@@ -115,6 +144,7 @@ public final class StorageScanner {
     }
 
     public func scan() -> ScanResult {
+        directoryMeasurementCache.removeAll()
         var recommendations: [Recommendation] = []
         report("Scanning Downloads", url: homeDirectory.appendingPathComponent("Downloads", isDirectory: true))
         recommendations += scanDownloads()
@@ -140,6 +170,20 @@ public final class StorageScanner {
             report("Scanning app leftovers and background services")
             recommendations += scanAppLeftovers()
         }
+        guard !isCancelled else { return makeResult(recommendations) }
+
+        let systemDataBreakdown: SystemDataBreakdown?
+        if config.enableSystemDataBreakdown {
+            report("Measuring visible System Data contributors")
+            let breakdown = scanSystemDataBreakdown()
+            recommendations += systemDataReviewRecommendations(from: breakdown.staleItems)
+            systemDataBreakdown = SystemDataBreakdown(
+                entries: breakdown.entries,
+                notes: breakdown.notes
+            )
+        } else {
+            systemDataBreakdown = nil
+        }
 
         let sorted = deduplicateByPath(recommendations).sorted {
             if $0.risk != $1.risk {
@@ -148,7 +192,7 @@ public final class StorageScanner {
             return $0.sizeBytes > $1.sizeBytes
         }
 
-        return makeResult(sorted)
+        return makeResult(sorted, systemDataBreakdown: systemDataBreakdown)
     }
 
     private func scanDownloads() -> [Recommendation] {
@@ -167,7 +211,7 @@ public final class StorageScanner {
                 return nil
             }
 
-            let ageDate = metadata.accessedDate ?? metadata.modifiedDate ?? metadata.createdDate
+            let ageDate = latestActivityDate(for: url, metadata: metadata)
             let ageDays = StorageFormatting.daysSince(ageDate, now: now) ?? 0
             let isDisposableType = isLikelyDisposableDownload(url)
             let isVeryLarge = size >= config.largeDownloadBytes
@@ -248,7 +292,8 @@ public final class StorageScanner {
                 return nil
             }
 
-            let ageDays = StorageFormatting.daysSince(metadata.modifiedDate ?? metadata.createdDate, now: now)
+            let ageDate = latestActivityDate(for: url, metadata: metadata)
+            let ageDays = StorageFormatting.daysSince(ageDate, now: now)
             guard (ageDays ?? config.oldCacheDays) >= config.oldCacheDays else {
                 return nil
             }
@@ -261,7 +306,7 @@ public final class StorageScanner {
                 risk: .low,
                 confidence: .high,
                 sizeBytes: size,
-                reason: "Cache folder, \(StorageFormatting.bytes(size)), last changed \(StorageFormatting.agePhrase(for: metadata.modifiedDate, now: now)).",
+                reason: "Cache folder, \(StorageFormatting.bytes(size)), last used or changed \(StorageFormatting.agePhrase(for: ageDate, now: now)).",
                 detail: "Caches are normally recreated by apps. Close the related app before moving its cache to Trash.",
                 defaultAction: .moveToTrash
             )
@@ -284,7 +329,8 @@ public final class StorageScanner {
                 return nil
             }
 
-            let ageDays = StorageFormatting.daysSince(metadata.modifiedDate ?? metadata.createdDate, now: now)
+            let ageDate = latestActivityDate(for: url, metadata: metadata)
+            let ageDays = StorageFormatting.daysSince(ageDate, now: now)
             guard (ageDays ?? config.oldLogDays) >= config.oldLogDays else {
                 return nil
             }
@@ -297,7 +343,7 @@ public final class StorageScanner {
                 risk: .low,
                 confidence: .high,
                 sizeBytes: size,
-                reason: "Log data, \(StorageFormatting.bytes(size)), last changed \(StorageFormatting.agePhrase(for: metadata.modifiedDate, now: now)).",
+                reason: "Log data, \(StorageFormatting.bytes(size)), last used or changed \(StorageFormatting.agePhrase(for: ageDate, now: now)).",
                 detail: "Logs are useful for debugging but are usually removable once no longer needed.",
                 defaultAction: .moveToTrash
             )
@@ -923,6 +969,10 @@ public final class StorageScanner {
         recommendations += scanAppTraceLeftovers(installedApps: inventory)
         guard !isCancelled else { return recommendations }
 
+        report("Checking stale app support folders")
+        recommendations += scanStaleAppSupportLeftovers(installedApps: inventory)
+        guard !isCancelled else { return recommendations }
+
         report("Checking running processes")
         let runningProcesses = config.includeRunningProcessScan
             ? RunningProcessInventory.load()
@@ -1025,6 +1075,16 @@ public final class StorageScanner {
         }
     }
 
+    private struct StaleAppSupportLocation {
+        let directory: URL
+        let label: String
+        let risk: RiskLevel
+        let confidence: ConfidenceLevel
+        let minimumBytes: Int64
+        let includeNestedAppFolders: Bool
+        let detail: String
+    }
+
     private func scanHomeConfigurationLeftovers(installedApps: InstalledAppInventory) -> [Recommendation] {
         let locations = [
             HomeConfigurationLeftoverLocation(
@@ -1080,7 +1140,7 @@ public final class StorageScanner {
                     continue
                 }
 
-                let ageDate = metadata.modifiedDate ?? metadata.createdDate
+                let ageDate = latestActivityDate(for: url, metadata: metadata)
                 let ageDays = StorageFormatting.daysSince(ageDate, now: now)
                 guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
                     continue
@@ -1097,6 +1157,104 @@ public final class StorageScanner {
                         sizeBytes: size,
                         reason: "\(location.label.capitalized), \(StorageFormatting.bytes(size)), but no installed app match was found.",
                         detail: "App configuration folders can contain hand-written settings or scripts. Review the contents before removing them.",
+                        defaultAction: .revealOnly
+                    )
+                )
+            }
+        }
+
+        return recommendations
+    }
+
+    private func scanStaleAppSupportLeftovers(installedApps: InstalledAppInventory) -> [Recommendation] {
+        let userLibrary = homeDirectory.appendingPathComponent("Library", isDirectory: true)
+        var locations = [
+            StaleAppSupportLocation(
+                directory: userLibrary.appendingPathComponent("Application Support", isDirectory: true),
+                label: "Application Support folder",
+                risk: .medium,
+                confidence: .low,
+                minimumBytes: config.minimumLeftoverBytes,
+                includeNestedAppFolders: true,
+                detail: "Application Support can contain user data, templates, databases, or licensed assets. This folder has no obvious installed app match, but review the contents before removing it."
+            )
+        ]
+
+        if config.includeSystemAppTraceScan {
+            locations += [
+                StaleAppSupportLocation(
+                    directory: URL(fileURLWithPath: "/Library/Application Support", isDirectory: true),
+                    label: "system Application Support folder",
+                    risk: .high,
+                    confidence: .low,
+                    minimumBytes: config.minimumLeftoverBytes,
+                    includeNestedAppFolders: true,
+                    detail: "System-wide Application Support can affect every user on this Mac. Prefer the vendor uninstaller when one exists, and review the folder before changing it."
+                ),
+                StaleAppSupportLocation(
+                    directory: URL(fileURLWithPath: "/Users/Shared", isDirectory: true),
+                    label: "shared app support folder",
+                    risk: .high,
+                    confidence: .low,
+                    minimumBytes: config.minimumLeftoverBytes,
+                    includeNestedAppFolders: true,
+                    detail: "Shared folders can contain assets, libraries, licenses, or data used by multiple user accounts. Review before removing them."
+                )
+            ]
+        }
+
+        var recommendations: [Recommendation] = []
+
+        for location in locations {
+            guard !isCancelled else { return recommendations }
+            guard fileManager.storageAssistantFileExists(at: location.directory) else {
+                continue
+            }
+
+            for url in staleAppSupportCandidates(for: location) {
+                guard !isCancelled else { return recommendations }
+                guard
+                    let metadata = fileManager.storageAssistantMetadata(for: url),
+                    metadata.isDirectory,
+                    !metadata.isSymbolicLink,
+                    !isProtectedLeftoverPath(url)
+                else {
+                    continue
+                }
+
+                let identity = leftoverIdentity(for: url)
+                guard shouldFlagAppSupportLeftover(identity: identity, url: url, installedApps: installedApps) else {
+                    continue
+                }
+
+                let size = itemSize(url, metadata: metadata)
+                guard size >= location.minimumBytes else {
+                    continue
+                }
+
+                let ageDate = latestActivityDate(for: url, metadata: metadata)
+                let ageDays = StorageFormatting.daysSince(ageDate, now: now)
+                guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
+                    continue
+                }
+
+                let knownSignature = knownLeftoverSignature(matching: "\(url.path) \(identity)")
+                let displayName = knownSignature?.displayName ?? "\(identity) \(location.label)"
+                let reason = knownSignature == nil
+                    ? "\(StorageFormatting.bytes(size)) in \(location.label), with no installed app match found, last used or changed \(StorageFormatting.agePhrase(for: ageDate, now: now))."
+                    : "\(knownSignature!.displayName) component found, \(StorageFormatting.bytes(size)), with no obvious installed owner."
+
+                recommendations.append(
+                    recommendation(
+                        url: url,
+                        metadata: metadata,
+                        displayName: displayName,
+                        category: .leftovers,
+                        risk: knownSignature == nil ? location.risk : maxRisk(location.risk, .medium),
+                        confidence: knownSignature == nil ? location.confidence : .high,
+                        sizeBytes: size,
+                        reason: reason,
+                        detail: knownSignature?.detail ?? location.detail,
                         defaultAction: .revealOnly
                     )
                 )
@@ -1252,7 +1410,7 @@ public final class StorageScanner {
                 }
 
                 if location.requiresStaleDate {
-                    let ageDate = metadata.modifiedDate ?? metadata.createdDate
+                    let ageDate = latestActivityDate(for: url, metadata: metadata)
                     let ageDays = StorageFormatting.daysSince(ageDate, now: now)
                     guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
                         continue
@@ -1277,6 +1435,136 @@ public final class StorageScanner {
         }
 
         return recommendations
+    }
+
+    private func staleAppSupportCandidates(for location: StaleAppSupportLocation) -> [URL] {
+        var seen: Set<String> = []
+        var candidates: [URL] = []
+
+        func appendCandidate(_ url: URL) {
+            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+            guard seen.insert(path).inserted else { return }
+            candidates.append(url)
+        }
+
+        for child in immediateChildren(of: location.directory) {
+            guard !isCancelled else { break }
+            guard
+                let metadata = fileManager.storageAssistantMetadata(for: child),
+                metadata.isDirectory,
+                !metadata.isSymbolicLink,
+                !isProtectedLeftoverPath(child)
+            else {
+                continue
+            }
+
+            let nestedCandidates = location.includeNestedAppFolders
+                ? nestedAppSupportCandidates(in: child)
+                : []
+
+            if nestedCandidates.isEmpty {
+                appendCandidate(child)
+            } else {
+                nestedCandidates.forEach(appendCandidate)
+            }
+        }
+
+        return candidates
+    }
+
+    private func nestedAppSupportCandidates(in parent: URL) -> [URL] {
+        let parentIdentity = leftoverIdentity(for: parent)
+        guard
+            !isBundleIdentifierCandidate(parentIdentity),
+            knownLeftoverSignature(matching: "\(parent.path) \(parentIdentity)") == nil
+        else {
+            return []
+        }
+
+        return immediateChildren(of: parent).compactMap { child in
+            guard !isCancelled else { return nil }
+            guard
+                let metadata = fileManager.storageAssistantMetadata(for: child),
+                metadata.isDirectory,
+                !metadata.isSymbolicLink,
+                !isProtectedLeftoverPath(child),
+                isSpecificNestedAppSupportName(child.lastPathComponent)
+            else {
+                return nil
+            }
+
+            return child
+        }
+    }
+
+    private func shouldFlagAppSupportLeftover(
+        identity: String,
+        url: URL,
+        installedApps: InstalledAppInventory
+    ) -> Bool {
+        if isProtectedBundleIdentifier(identity) {
+            return false
+        }
+
+        if knownLeftoverSignature(matching: "\(identity) \(url.path)") != nil {
+            return true
+        }
+
+        if isBundleIdentifierCandidate(identity) {
+            return !installedApps.containsBundleIdentifierLike(identity)
+        }
+
+        let normalized = normalizedAppToken(identity)
+        guard normalized.count >= 3 else {
+            return false
+        }
+
+        return !installedApps.containsRelatedNameLike(identity)
+    }
+
+    private func isSpecificNestedAppSupportName(_ name: String) -> Bool {
+        let normalized = normalizedAppToken(name)
+        guard normalized.count >= 3 else {
+            return false
+        }
+
+        let genericNames: Set<String> = [
+            "application",
+            "applicationsupport",
+            "assets",
+            "cache",
+            "caches",
+            "common",
+            "data",
+            "database",
+            "databases",
+            "framework",
+            "frameworks",
+            "helper",
+            "helpers",
+            "license",
+            "licenses",
+            "log",
+            "logs",
+            "metadata",
+            "plugin",
+            "plugins",
+            "preferences",
+            "resources",
+            "service",
+            "services",
+            "settings",
+            "shared",
+            "storage",
+            "support",
+            "temp",
+            "temporary",
+            "update",
+            "updater",
+            "updates"
+        ]
+
+        return !genericNames.contains(normalized)
     }
 
     private func pluginTraceLocations(
@@ -1529,7 +1817,7 @@ public final class StorageScanner {
                 }
 
                 if location.requiresStaleDate && knownSignature == nil {
-                    let ageDate = metadata.modifiedDate ?? metadata.createdDate
+                    let ageDate = latestActivityDate(for: url, metadata: metadata)
                     let ageDays = StorageFormatting.daysSince(ageDate, now: now)
                     guard (ageDays ?? config.leftoverStaleDays) >= config.leftoverStaleDays else {
                         continue
@@ -1688,6 +1976,658 @@ public final class StorageScanner {
         }
 
         return recommendations
+    }
+
+    private func scanSystemDataBreakdown() -> SystemDataBreakdown {
+        var entries: [SystemDataEntry] = []
+        var staleItems: [SystemDataStaleItem] = []
+        var notes = [
+            "Apple does not expose an exact public breakdown for System Data. This lens measures visible folders that commonly contribute to it; protected system files, purgeable space, and some APFS accounting may not be included."
+        ]
+
+        for candidate in systemDataCandidates() {
+            guard !isCancelled else {
+                return SystemDataBreakdown(entries: entries, notes: notes)
+            }
+
+            guard
+                fileManager.storageAssistantFileExists(at: candidate.url),
+                let metadata = fileManager.storageAssistantMetadata(for: candidate.url),
+                !metadata.isSymbolicLink
+            else {
+                continue
+            }
+
+            report("Measuring \(candidate.title)", url: candidate.url)
+            let measurement = systemDataMeasurement(for: candidate, metadata: metadata)
+            guard measurement.sizeBytes > 0 || !measurement.contributors.isEmpty else {
+                continue
+            }
+
+            entries.append(
+                SystemDataEntry(
+                    title: candidate.title,
+                    category: candidate.category,
+                    path: candidate.url.path,
+                    sizeBytes: measurement.sizeBytes,
+                    detail: candidate.detail,
+                    contributors: measurement.contributors
+                )
+            )
+            staleItems += measurement.staleItems
+        }
+
+        if scansRealStartupVolume {
+            switch localSnapshotSummary() {
+            case .some(let summary) where summary.count > 0:
+                if let totalBytes = summary.totalBytes, totalBytes > 0 {
+                    entries.append(
+                        SystemDataEntry(
+                            title: "Local Time Machine snapshots",
+                            category: .localSnapshots,
+                            path: nil,
+                            sizeBytes: totalBytes,
+                            detail: "APFS local snapshots are system-managed restore points. They can be large but are usually purgeable by macOS when space is needed."
+                        )
+                    )
+                } else {
+                    notes.append("Found \(summary.count) local Time Machine snapshot\(summary.count == 1 ? "" : "s"), but macOS did not report their sizes.")
+                }
+            default:
+                break
+            }
+        }
+
+        return SystemDataBreakdown(
+            entries: entries.sorted {
+                ($0.sizeBytes ?? -1) > ($1.sizeBytes ?? -1)
+            },
+            notes: notes,
+            staleItems: deduplicateSystemDataStaleItems(staleItems)
+        )
+    }
+
+    private func systemDataCandidates() -> [SystemDataCandidate] {
+        let userLibrary = homeDirectory.appendingPathComponent("Library", isDirectory: true)
+        var candidates = [
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Application Support", isDirectory: true),
+                title: "User Application Support",
+                category: .userLibrary,
+                detail: "App databases, indexes, assets, and local support files. This is often one of the largest visible parts of Apple's System Data bucket."
+            ),
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Containers", isDirectory: true),
+                title: "Sandboxed app containers",
+                category: .appContainers,
+                detail: "Per-app sandbox data, including caches, databases, and documents stored inside app containers."
+            ),
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Group Containers", isDirectory: true),
+                title: "Shared app containers",
+                category: .appContainers,
+                detail: "Data shared between apps from the same developer, such as browser profiles, mail state, sync databases, and helper app data."
+            ),
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Caches", isDirectory: true),
+                title: "User caches",
+                category: .cachesAndLogs,
+                detail: "Rebuildable app caches in your user Library. Storage Assistant also surfaces older large cache folders as cleanup recommendations."
+            ),
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Logs", isDirectory: true),
+                title: "User logs",
+                category: .cachesAndLogs,
+                detail: "Application logs and diagnostics in your user Library."
+            ),
+            SystemDataCandidate(
+                url: userLibrary.appendingPathComponent("Developer", isDirectory: true),
+                title: "Developer support data",
+                category: .developerSupport,
+                detail: "Xcode, simulator, device support, archives, and other developer-tool support data."
+            )
+        ]
+
+        guard config.includeSystemAppTraceScan else {
+            return candidates
+        }
+
+        candidates += [
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/Library/Application Support", isDirectory: true),
+                title: "System-wide Application Support",
+                category: .systemLibrary,
+                detail: "Machine-wide support files, assets, frameworks, databases, and vendor data available to every user on this Mac."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/Library/Caches", isDirectory: true),
+                title: "System-wide caches",
+                category: .cachesAndLogs,
+                detail: "Machine-wide caches. These are system-scoped and should be inspected rather than removed directly."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/Library/Logs", isDirectory: true),
+                title: "System-wide logs",
+                category: .cachesAndLogs,
+                detail: "Machine-wide logs and diagnostic output."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/Library/Developer", isDirectory: true),
+                title: "System-wide developer data",
+                category: .developerSupport,
+                detail: "Developer tooling installed at the system level, including command line tool support and shared device data."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/Users/Shared", isDirectory: true),
+                title: "Shared user storage",
+                category: .systemLibrary,
+                detail: "Shared assets and support folders visible to all local users."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/private/var/folders", isDirectory: true),
+                title: "Per-user temporary system folders",
+                category: .temporaryStorage,
+                detail: "macOS-managed temporary files and per-user caches. These usually clear over time and are not a direct deletion target."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/private/var/tmp", isDirectory: true),
+                title: "System temporary folder",
+                category: .temporaryStorage,
+                detail: "Temporary files used by macOS and command-line tools."
+            ),
+            SystemDataCandidate(
+                url: URL(fileURLWithPath: "/private/var/vm", isDirectory: true),
+                title: "Swap and sleep files",
+                category: .virtualMemory,
+                detail: "Virtual memory swap files and sleep images managed by macOS. Their size changes with memory pressure and sleep behavior."
+            )
+        ]
+
+        return candidates
+    }
+
+    private func systemDataMeasurement(
+        for candidate: SystemDataCandidate,
+        metadata: FileMetadata
+    ) -> SystemDataMeasurement {
+        let url = candidate.url
+        guard metadata.isDirectory else {
+            return SystemDataMeasurement(
+                sizeBytes: metadata.allocatedSize,
+                contributors: [],
+                staleItems: []
+            )
+        }
+
+        var total: Int64 = 0
+        var contributors: [SystemDataContributor] = []
+        var staleItems: [SystemDataStaleItem] = []
+
+        for child in immediateChildren(of: url) {
+            guard !isCancelled else { break }
+            guard
+                let childMetadata = fileManager.storageAssistantMetadata(for: child),
+                !childMetadata.isSymbolicLink
+            else {
+                continue
+            }
+
+            let size = itemSize(child, metadata: childMetadata)
+            total += size
+
+            if size > 0 {
+                contributors.append(
+                    SystemDataContributor(
+                        path: child.path,
+                        displayName: child.lastPathComponent,
+                        sizeBytes: size
+                    )
+                )
+            }
+
+            if let staleItem = systemDataStaleItem(
+                candidate: candidate,
+                url: child,
+                metadata: childMetadata,
+                sizeBytes: size
+            ) {
+                staleItems.append(staleItem)
+            }
+        }
+
+        return SystemDataMeasurement(
+            sizeBytes: total,
+            contributors: contributors
+                .sorted { $0.sizeBytes > $1.sizeBytes }
+                .prefix(8)
+                .map { $0 },
+            staleItems: staleItems
+        )
+    }
+
+    private func systemDataStaleItem(
+        candidate: SystemDataCandidate,
+        url: URL,
+        metadata: FileMetadata,
+        sizeBytes: Int64
+    ) -> SystemDataStaleItem? {
+        guard sizeBytes >= minimumSystemDataStaleBytes(for: candidate) else {
+            return nil
+        }
+
+        guard let lastUsedDate = latestActivityDate(for: url, metadata: metadata) else {
+            return nil
+        }
+
+        guard let staleDays = staleDays(for: candidate) else {
+            return nil
+        }
+
+        guard (StorageFormatting.daysSince(lastUsedDate, now: now) ?? 0) >= staleDays else {
+            return nil
+        }
+
+        let safety = systemDataSafety(for: candidate, url: url)
+        let agePhrase = StorageFormatting.agePhrase(for: lastUsedDate, now: now)
+        return SystemDataStaleItem(
+            path: url.path,
+            displayName: url.lastPathComponent,
+            category: candidate.category,
+            recommendationCategory: safety.recommendationCategory,
+            risk: safety.risk,
+            confidence: safety.confidence,
+            sizeBytes: sizeBytes,
+            createdDate: metadata.createdDate,
+            modifiedDate: metadata.modifiedDate,
+            accessedDate: metadata.accessedDate,
+            lastUsedDate: lastUsedDate,
+            reason: "\(StorageFormatting.bytes(sizeBytes)) in \(candidate.title), last used or changed \(agePhrase).",
+            detail: safety.detail,
+            defaultAction: safety.action
+        )
+    }
+
+    private func systemDataReviewRecommendations(from items: [SystemDataStaleItem]) -> [Recommendation] {
+        items.compactMap { item in
+            let path = item.path
+            guard !item.canMoveToTrash,
+                  ![RecommendationCategory.caches, .logs].contains(item.recommendationCategory),
+                  !path.contains("/Library/Caches/"),
+                  !path.contains("/Library/Logs/"),
+                  !(config.enableAppLeftoverScan && isApplicationSupportReviewPath(path)) else {
+                return nil
+            }
+
+            return Recommendation(
+                path: item.path,
+                displayName: item.displayName,
+                category: .leftovers,
+                risk: item.risk,
+                confidence: item.confidence,
+                sizeBytes: item.sizeBytes,
+                createdDate: item.createdDate,
+                modifiedDate: item.modifiedDate,
+                accessedDate: item.accessedDate,
+                reason: item.reason,
+                detail: item.detail,
+                defaultAction: item.defaultAction
+            )
+        }
+    }
+
+    private func isApplicationSupportReviewPath(_ path: String) -> Bool {
+        let userApplicationSupport = homeDirectory
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+            .path
+
+        return path.hasPrefix(userApplicationSupport + "/") ||
+            path.hasPrefix("/Library/Application Support/") ||
+            path.hasPrefix("/Users/Shared/")
+    }
+
+    private func minimumSystemDataStaleBytes(for candidate: SystemDataCandidate) -> Int64 {
+        switch candidate.category {
+        case .cachesAndLogs:
+            if candidate.url.lastPathComponent.localizedCaseInsensitiveContains("Logs") {
+                return config.minimumLogBytes
+            }
+            return config.minimumCacheBytes
+        case .temporaryStorage:
+            return min(config.minimumCacheBytes, 50 * 1_024 * 1_024)
+        case .virtualMemory, .localSnapshots:
+            return Int64.max
+        case .developerSupport:
+            return config.minimumDeveloperArtifactBytes
+        case .userLibrary, .appContainers, .systemLibrary:
+            return max(config.minimumLeftoverBytes, 10 * 1_024 * 1_024)
+        }
+    }
+
+    private func staleDays(for candidate: SystemDataCandidate) -> Int? {
+        switch candidate.category {
+        case .cachesAndLogs:
+            return candidate.url.lastPathComponent.localizedCaseInsensitiveContains("Logs")
+                ? config.oldLogDays
+                : config.oldCacheDays
+        case .temporaryStorage:
+            return min(max(config.oldCacheDays, 7), 30)
+        case .developerSupport, .userLibrary, .appContainers, .systemLibrary:
+            return config.leftoverStaleDays
+        case .virtualMemory, .localSnapshots:
+            return nil
+        }
+    }
+
+    private func systemDataSafety(
+        for candidate: SystemDataCandidate,
+        url: URL
+    ) -> (
+        risk: RiskLevel,
+        confidence: ConfidenceLevel,
+        action: CleanupAction,
+        recommendationCategory: RecommendationCategory,
+        detail: String
+    ) {
+        let path = url.path
+        let userCacheRoot = homeDirectory.appendingPathComponent("Library/Caches", isDirectory: true).path
+        let userLogRoot = homeDirectory.appendingPathComponent("Library/Logs", isDirectory: true).path
+
+        if path.hasPrefix(userCacheRoot + "/") {
+            return (
+                .low,
+                .high,
+                .moveToTrash,
+                .caches,
+                "User cache folders are normally rebuildable. Quit the related app before moving the folder to Trash."
+            )
+        }
+
+        if path.hasPrefix(userLogRoot + "/") {
+            return (
+                .low,
+                .high,
+                .moveToTrash,
+                .logs,
+                "Old user logs are normally disposable once you no longer need them for troubleshooting."
+            )
+        }
+
+        if path.hasPrefix("/Library/Caches/") {
+            return (
+                .high,
+                .low,
+                .revealOnly,
+                .caches,
+                "This is a system-wide cache. Inspect it or use the vendor's cleanup tools rather than deleting it directly."
+            )
+        }
+
+        if path.hasPrefix("/Library/Logs/") {
+            return (
+                .high,
+                .low,
+                .revealOnly,
+                .logs,
+                "This is a system-wide log folder. Review it before removing anything because it may affect every user on this Mac."
+            )
+        }
+
+        if path.hasPrefix("/private/var/") {
+            return (
+                .medium,
+                .low,
+                .revealOnly,
+                .leftovers,
+                "This is macOS-managed temporary or runtime storage. It may clear by itself; review before manually removing files."
+            )
+        }
+
+        if path.contains("/Developer/") || path.contains("/CoreSimulator") || path.contains("/Xcode") {
+            return (
+                .medium,
+                .medium,
+                .revealOnly,
+                .xcode,
+                "Developer support data can include simulators, archives, and device support. Prefer Xcode or command-line cleanup tools when available."
+            )
+        }
+
+        return (
+            candidate.category == .systemLibrary ? .high : .medium,
+            .low,
+            .revealOnly,
+            .leftovers,
+            "This may be app support data rather than disposable cache. Reveal it and confirm the owning app or service before removing it."
+        )
+    }
+
+    private func systemDataCategory(
+        for url: URL,
+        recommendationCategory: RecommendationCategory
+    ) -> SystemDataCategory {
+        let path = url.path
+
+        if path.contains("/Caches/") || path.contains("/Logs/") {
+            return .cachesAndLogs
+        }
+
+        if path.contains("/Containers/") || path.contains("/Group Containers/") {
+            return .appContainers
+        }
+
+        if path.contains("/Developer/") ||
+            path.contains("/CoreSimulator") ||
+            [.xcode, .unity, .docker, .python, .node, .homebrew, .buildArtifacts].contains(recommendationCategory) {
+            return .developerSupport
+        }
+
+        if path.hasPrefix("/private/var/vm/") {
+            return .virtualMemory
+        }
+
+        if path.hasPrefix("/private/var/") {
+            return .temporaryStorage
+        }
+
+        if path.hasPrefix("/Library/") || path.hasPrefix("/Users/Shared/") {
+            return .systemLibrary
+        }
+
+        return .userLibrary
+    }
+
+    private func isLikelySystemDataPath(_ path: String) -> Bool {
+        let homePath = homeDirectory.path
+        let userLibraryPath = homeDirectory.appendingPathComponent("Library", isDirectory: true).path
+        let hiddenDeveloperCachePrefixes = [
+            ".cache",
+            ".gradle",
+            ".m2",
+            ".npm",
+            ".pub-cache",
+            ".rustup",
+            ".swiftpm"
+        ].map { "\(homePath)/\($0)" }
+
+        return path.hasPrefix(userLibraryPath + "/") ||
+            path.hasPrefix("/Library/") ||
+            path.hasPrefix("/Users/Shared/") ||
+            path.hasPrefix("/private/var/") ||
+            hiddenDeveloperCachePrefixes.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    private func latestDate(_ dates: [Date?]) -> Date? {
+        dates.compactMap { $0 }.max()
+    }
+
+    private func deduplicateSystemDataStaleItems(_ items: [SystemDataStaleItem]) -> [SystemDataStaleItem] {
+        var bestByPath: [String: SystemDataStaleItem] = [:]
+
+        for item in items {
+            let canonicalPath = URL(fileURLWithPath: item.path)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+
+            guard let existing = bestByPath[canonicalPath] else {
+                bestByPath[canonicalPath] = item
+                continue
+            }
+
+            if systemDataStaleItemScore(item) > systemDataStaleItemScore(existing) {
+                bestByPath[canonicalPath] = item
+            }
+        }
+
+        return Array(bestByPath.values).sorted {
+            if $0.canMoveToTrash != $1.canMoveToTrash {
+                return $0.canMoveToTrash
+            }
+            return $0.sizeBytes > $1.sizeBytes
+        }
+    }
+
+    private func systemDataStaleItemScore(_ item: SystemDataStaleItem) -> Int {
+        var score = item.canMoveToTrash ? 10 : 0
+        switch item.confidence {
+        case .high: score += 3
+        case .medium: score += 2
+        case .low: score += 1
+        }
+        score -= riskSortValue(item.risk)
+        return score
+    }
+
+    private var scansRealStartupVolume: Bool {
+        homeDirectory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path ==
+            FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+    }
+
+    private func localSnapshotSummary() -> LocalSnapshotSummary? {
+        if let summary = diskutilSnapshotSummary() {
+            return summary
+        }
+
+        return tmutilSnapshotSummary()
+    }
+
+    private func diskutilSnapshotSummary() -> LocalSnapshotSummary? {
+        guard let data = commandOutput(
+            executable: "/usr/sbin/diskutil",
+            arguments: ["apfs", "listSnapshots", "/", "-plist"]
+        ) else {
+            return nil
+        }
+
+        guard
+            let plist = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        else {
+            return nil
+        }
+
+        let snapshots = plist["Snapshots"] as? [[String: Any]] ??
+            plist["APFSSnapshots"] as? [[String: Any]] ??
+            []
+        guard !snapshots.isEmpty else {
+            return nil
+        }
+
+        var total: Int64 = 0
+        var hasSizes = false
+        let names = snapshots.compactMap { snapshot -> String? in
+            snapshot["SnapshotName"] as? String ??
+                snapshot["Name"] as? String
+        }
+
+        for snapshot in snapshots {
+            guard let size = snapshotSize(snapshot) else {
+                continue
+            }
+            total += size
+            hasSizes = true
+        }
+
+        return LocalSnapshotSummary(
+            count: snapshots.count,
+            totalBytes: hasSizes ? total : nil,
+            names: names
+        )
+    }
+
+    private func tmutilSnapshotSummary() -> LocalSnapshotSummary? {
+        guard let data = commandOutput(
+            executable: "/usr/bin/tmutil",
+            arguments: ["listlocalsnapshots", "/"]
+        ) else {
+            return nil
+        }
+
+        let names = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !names.isEmpty else {
+            return nil
+        }
+
+        return LocalSnapshotSummary(
+            count: names.count,
+            totalBytes: nil,
+            names: names
+        )
+    }
+
+    private func snapshotSize(_ snapshot: [String: Any]) -> Int64? {
+        for key in ["Size", "SnapshotSize", "PurgeableSize", "CapacityInUse"] {
+            if let value = snapshot[key] as? NSNumber {
+                return value.int64Value
+            }
+
+            if let value = snapshot[key] as? String,
+               let bytes = Int64(value) {
+                return bytes
+            }
+        }
+
+        return nil
+    }
+
+    private func commandOutput(executable: String, arguments: [String]) -> Data? {
+        guard fileManager.isExecutableFile(atPath: executable) else {
+            return nil
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        return outputPipe.fileHandleForReading.readDataToEndOfFile()
     }
 
     private func leftoverIdentity(for url: URL) -> String {
@@ -2230,18 +3170,53 @@ public final class StorageScanner {
 
     private func itemSize(_ url: URL, metadata: FileMetadata) -> Int64 {
         if metadata.isDirectory {
-            return directoryAllocatedSize(url)
+            return directoryMeasurement(for: url).allocatedSize
         }
         return metadata.allocatedSize
     }
 
-    private func directoryAllocatedSize(_ directory: URL) -> Int64 {
+    private func latestActivityDate(for url: URL, metadata: FileMetadata) -> Date? {
+        let ownActivityDate = latestDate([
+            metadata.accessedDate,
+            metadata.modifiedDate,
+            metadata.createdDate
+        ])
+
+        guard metadata.isDirectory else {
+            return ownActivityDate
+        }
+
+        return latestDate([
+            ownActivityDate,
+            directoryMeasurement(for: url).latestActivityDate
+        ])
+    }
+
+    private func directoryMeasurement(for directory: URL) -> DirectoryMeasurement {
+        let cacheKey = directory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+
+        if let measurement = directoryMeasurementCache[cacheKey] {
+            return measurement
+        }
+
+        let measurement = measureDirectory(directory)
+        directoryMeasurementCache[cacheKey] = measurement
+        return measurement
+    }
+
+    private func measureDirectory(_ directory: URL) -> DirectoryMeasurement {
         let keys: [URLResourceKey] = [
             .isDirectoryKey,
             .isSymbolicLinkKey,
             .fileSizeKey,
             .fileAllocatedSizeKey,
-            .totalFileAllocatedSizeKey
+            .totalFileAllocatedSizeKey,
+            .creationDateKey,
+            .contentModificationDateKey,
+            .contentAccessDateKey
         ]
 
         guard let enumerator = fileManager.enumerator(
@@ -2262,10 +3237,11 @@ public final class StorageScanner {
                 kind: .notReadable,
                 message: "Could not enumerate \(directory.storageAssistantDisplayPath)."
             )
-            return 0
+            return DirectoryMeasurement(allocatedSize: 0, latestActivityDate: nil)
         }
 
         var total: Int64 = 0
+        var latestActivityDate: Date?
 
         for case let url as URL in enumerator {
             guard !isCancelled else {
@@ -2284,6 +3260,13 @@ public final class StorageScanner {
                 continue
             }
 
+            latestActivityDate = latestDate([
+                latestActivityDate,
+                metadata.accessedDate,
+                metadata.modifiedDate,
+                metadata.createdDate
+            ])
+
             if metadata.isDirectory {
                 continue
             }
@@ -2291,7 +3274,10 @@ public final class StorageScanner {
             total += metadata.allocatedSize
         }
 
-        return total
+        return DirectoryMeasurement(
+            allocatedSize: total,
+            latestActivityDate: latestActivityDate
+        )
     }
 
     private func isLikelyDisposableDownload(_ url: URL) -> Bool {
@@ -2434,11 +3420,15 @@ public final class StorageScanner {
         }
     }
 
-    private func makeResult(_ recommendations: [Recommendation]) -> ScanResult {
+    private func makeResult(
+        _ recommendations: [Recommendation],
+        systemDataBreakdown: SystemDataBreakdown? = nil
+    ) -> ScanResult {
         ScanResult(
             scanDate: now,
             recommendations: recommendations,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            systemDataBreakdown: systemDataBreakdown
         )
     }
 }

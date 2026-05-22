@@ -162,33 +162,44 @@ private struct RecommendationList: View {
     @Binding var selectedRecommendation: Recommendation?
 
     var body: some View {
-        VStack(spacing: 0) {
-            SummaryHeader(
-                count: viewModel.visibleRecommendations.count,
-                bytes: viewModel.totalPotentialBytes,
-                isScanning: viewModel.isScanning,
-                progress: viewModel.scanProgress,
-                growthSummary: viewModel.growthSummary,
-                diagnostics: viewModel.diagnostics
-            )
-
-            Divider()
-
-            if viewModel.visibleRecommendations.isEmpty {
-                EmptyState(isScanning: viewModel.isScanning)
+        Group {
+            if viewModel.selectedReviewArea == .systemData {
+                SystemDataLensView(
+                    breakdown: viewModel.systemDataBreakdown,
+                    isScanning: viewModel.isScanning,
+                    progress: viewModel.scanProgress,
+                    reveal: { viewModel.revealSystemDataPath($0) }
+                )
             } else {
-                List {
-                    ForEach(viewModel.visibleRecommendations) { recommendation in
-                        RecommendationRow(
-                            recommendation: recommendation,
-                            details: { selectedRecommendation = recommendation },
-                            reveal: { viewModel.reveal(recommendation) },
-                            ignore: { viewModel.ignore(recommendation) },
-                            moveToTrash: { viewModel.moveToTrash(recommendation) }
-                        )
+                VStack(spacing: 0) {
+                    SummaryHeader(
+                        count: viewModel.visibleRecommendations.count,
+                        bytes: viewModel.totalPotentialBytes,
+                        isScanning: viewModel.isScanning,
+                        progress: viewModel.scanProgress,
+                        growthSummary: viewModel.growthSummary,
+                        diagnostics: viewModel.diagnostics
+                    )
+
+                    Divider()
+
+                    if viewModel.visibleRecommendations.isEmpty {
+                        EmptyState(isScanning: viewModel.isScanning)
+                    } else {
+                        List {
+                            ForEach(viewModel.visibleRecommendations) { recommendation in
+                                RecommendationRow(
+                                    recommendation: recommendation,
+                                    details: { selectedRecommendation = recommendation },
+                                    reveal: { viewModel.reveal(recommendation) },
+                                    ignore: { viewModel.ignore(recommendation) },
+                                    moveToTrash: { viewModel.moveToTrash(recommendation) }
+                                )
+                            }
+                        }
+                        .listStyle(.inset)
                     }
                 }
-                .listStyle(.inset)
             }
         }
         .navigationTitle(viewModel.selectedReviewArea.title)
@@ -286,6 +297,236 @@ private struct EmptyState: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct SystemDataLensView: View {
+    let breakdown: SystemDataBreakdown?
+    let isScanning: Bool
+    let progress: ScanProgress?
+    let reveal: (String) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 22) {
+                MetricBlock(
+                    title: "Known Visible System Data",
+                    value: StorageFormatting.bytes(breakdown?.totalKnownBytes ?? 0)
+                )
+                MetricBlock(
+                    title: "Locations Measured",
+                    value: "\(breakdown?.entries.count ?? 0)"
+                )
+                MetricBlock(
+                    title: "Notes",
+                    value: "\(breakdown?.notes.count ?? 0)"
+                )
+
+                Spacer()
+
+                if isScanning {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(progress?.message ?? "Scanning")
+                                .font(.caption.weight(.medium))
+
+                            if let currentPath = progress?.currentPath {
+                                Text(currentPath)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 340, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 18)
+
+            Divider()
+
+            if let breakdown, !breakdown.entries.isEmpty {
+                List {
+                    if !breakdown.notes.isEmpty {
+                        Section("Context") {
+                            ForEach(breakdown.notes, id: \.self) { note in
+                                Label(note, systemImage: "info.circle")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 4)
+                            }
+                        }
+                    }
+
+                    Section("Visible Contributors") {
+                        ForEach(breakdown.entries) { entry in
+                            SystemDataEntryRow(entry: entry, reveal: reveal)
+                        }
+                    }
+                }
+                .listStyle(.inset)
+            } else {
+                SystemDataEmptyState(isScanning: isScanning)
+            }
+        }
+    }
+}
+
+private struct SystemDataEmptyState: View {
+    let isScanning: Bool
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: isScanning ? "magnifyingglass" : "internaldrive")
+                .font(.system(size: 44))
+                .foregroundStyle(.secondary)
+
+            Text(isScanning ? "Measuring..." : "No visible System Data measured")
+                .font(.title3.weight(.semibold))
+
+            Text(isScanning ? "Large Library folders can take a moment." : "Protected or purgeable storage may still be included in Apple's System Data total.")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct SystemDataEntryRow: View {
+    let entry: SystemDataEntry
+    let reveal: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Image(systemName: systemDataSymbol(entry.category))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18)
+
+                        Text(entry.title)
+                            .font(.headline)
+                            .lineLimit(1)
+
+                        Text(entry.category.title)
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .foregroundStyle(.secondary)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                    }
+
+                    if let path = entry.path {
+                        Text(URL(fileURLWithPath: path).storageAssistantDisplayPath)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Spacer()
+
+                Text(entry.sizeBytes.map(StorageFormatting.bytes) ?? "Unknown")
+                    .font(.title3.weight(.semibold))
+                    .monospacedDigit()
+            }
+
+            Text(entry.detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            if !entry.contributors.isEmpty {
+                DisclosureGroup {
+                    VStack(spacing: 6) {
+                        ForEach(entry.contributors) { contributor in
+                            SystemDataContributorRow(
+                                contributor: contributor,
+                                reveal: reveal
+                            )
+                        }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Text("Largest visible contributors")
+                        .font(.caption.weight(.medium))
+                }
+            }
+
+            HStack {
+                Spacer()
+
+                if let path = entry.path {
+                    Button {
+                        reveal(path)
+                    } label: {
+                        Label("Reveal", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(.vertical, 10)
+    }
+}
+
+private struct SystemDataContributorRow: View {
+    let contributor: SystemDataContributor
+    let reveal: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(contributor.displayName)
+                    .lineLimit(1)
+
+                Text(URL(fileURLWithPath: contributor.path).storageAssistantDisplayPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+
+            Spacer()
+
+            if contributor.sizeBytes > 0 {
+                Text(StorageFormatting.bytes(contributor.sizeBytes))
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                reveal(contributor.path)
+            } label: {
+                Label("Reveal", systemImage: "magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+}
+
+private func systemDataSymbol(_ category: SystemDataCategory) -> String {
+    switch category {
+    case .userLibrary: "books.vertical"
+    case .appContainers: "shippingbox"
+    case .cachesAndLogs: "externaldrive.badge.timemachine"
+    case .developerSupport: "hammer"
+    case .systemLibrary: "building.columns"
+    case .temporaryStorage: "clock.arrow.circlepath"
+    case .virtualMemory: "memorychip"
+    case .localSnapshots: "clock.arrow.2.circlepath"
     }
 }
 

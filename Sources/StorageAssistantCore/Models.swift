@@ -144,15 +144,18 @@ public struct ScanResult: Codable, Hashable, Sendable {
     public let scanDate: Date
     public let recommendations: [Recommendation]
     public let diagnostics: [PermissionDiagnostic]
+    public let systemDataBreakdown: SystemDataBreakdown?
 
     public init(
         scanDate: Date,
         recommendations: [Recommendation],
-        diagnostics: [PermissionDiagnostic] = []
+        diagnostics: [PermissionDiagnostic] = [],
+        systemDataBreakdown: SystemDataBreakdown? = nil
     ) {
         self.scanDate = scanDate
         self.recommendations = recommendations
         self.diagnostics = diagnostics
+        self.systemDataBreakdown = systemDataBreakdown
     }
 
     public var totalPotentialBytes: Int64 {
@@ -163,7 +166,161 @@ public struct ScanResult: Codable, Hashable, Sendable {
         ScanResult(
             scanDate: scanDate,
             recommendations: recommendations.filter { !ignoredKeys.contains($0.ignoreKey) },
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            systemDataBreakdown: systemDataBreakdown?.filtered(ignoredKeys: ignoredKeys)
+        )
+    }
+}
+
+public enum SystemDataCategory: String, Codable, CaseIterable, Hashable, Sendable {
+    case userLibrary
+    case appContainers
+    case cachesAndLogs
+    case developerSupport
+    case systemLibrary
+    case temporaryStorage
+    case virtualMemory
+    case localSnapshots
+
+    public var title: String {
+        switch self {
+        case .userLibrary: "User Library"
+        case .appContainers: "App Containers"
+        case .cachesAndLogs: "Caches & Logs"
+        case .developerSupport: "Developer Support"
+        case .systemLibrary: "System Library"
+        case .temporaryStorage: "Temporary Storage"
+        case .virtualMemory: "Virtual Memory"
+        case .localSnapshots: "Local Snapshots"
+        }
+    }
+}
+
+public struct SystemDataContributor: Identifiable, Codable, Hashable, Sendable {
+    public var id: String { path }
+
+    public let path: String
+    public let displayName: String
+    public let sizeBytes: Int64
+
+    public init(path: String, displayName: String, sizeBytes: Int64) {
+        self.path = path
+        self.displayName = displayName
+        self.sizeBytes = sizeBytes
+    }
+}
+
+public struct SystemDataStaleItem: Identifiable, Codable, Hashable, Sendable {
+    public var id: String { path }
+
+    public let path: String
+    public let displayName: String
+    public let category: SystemDataCategory
+    public let recommendationCategory: RecommendationCategory
+    public let risk: RiskLevel
+    public let confidence: ConfidenceLevel
+    public let sizeBytes: Int64
+    public let createdDate: Date?
+    public let modifiedDate: Date?
+    public let accessedDate: Date?
+    public let lastUsedDate: Date?
+    public let reason: String
+    public let detail: String
+    public let defaultAction: CleanupAction
+
+    public init(
+        path: String,
+        displayName: String,
+        category: SystemDataCategory,
+        recommendationCategory: RecommendationCategory,
+        risk: RiskLevel,
+        confidence: ConfidenceLevel,
+        sizeBytes: Int64,
+        createdDate: Date?,
+        modifiedDate: Date?,
+        accessedDate: Date?,
+        lastUsedDate: Date?,
+        reason: String,
+        detail: String,
+        defaultAction: CleanupAction
+    ) {
+        self.path = path
+        self.displayName = displayName
+        self.category = category
+        self.recommendationCategory = recommendationCategory
+        self.risk = risk
+        self.confidence = confidence
+        self.sizeBytes = sizeBytes
+        self.createdDate = createdDate
+        self.modifiedDate = modifiedDate
+        self.accessedDate = accessedDate
+        self.lastUsedDate = lastUsedDate
+        self.reason = reason
+        self.detail = detail
+        self.defaultAction = defaultAction
+    }
+
+    public var canMoveToTrash: Bool {
+        defaultAction == .moveToTrash && risk != .high
+    }
+
+    public var ignoreKey: String {
+        "\(recommendationCategory.rawValue)|\(path)"
+    }
+}
+
+public struct SystemDataEntry: Identifiable, Codable, Hashable, Sendable {
+    public let id: String
+    public let title: String
+    public let category: SystemDataCategory
+    public let path: String?
+    public let sizeBytes: Int64?
+    public let detail: String
+    public let contributors: [SystemDataContributor]
+
+    public init(
+        id: String? = nil,
+        title: String,
+        category: SystemDataCategory,
+        path: String?,
+        sizeBytes: Int64?,
+        detail: String,
+        contributors: [SystemDataContributor] = []
+    ) {
+        self.id = id ?? "\(category.rawValue)|\(path ?? title)"
+        self.title = title
+        self.category = category
+        self.path = path
+        self.sizeBytes = sizeBytes
+        self.detail = detail
+        self.contributors = contributors
+    }
+}
+
+public struct SystemDataBreakdown: Codable, Hashable, Sendable {
+    public let entries: [SystemDataEntry]
+    public let notes: [String]
+    public let staleItems: [SystemDataStaleItem]
+
+    public init(
+        entries: [SystemDataEntry],
+        notes: [String] = [],
+        staleItems: [SystemDataStaleItem] = []
+    ) {
+        self.entries = entries
+        self.notes = notes
+        self.staleItems = staleItems
+    }
+
+    public var totalKnownBytes: Int64 {
+        entries.reduce(0) { $0 + ($1.sizeBytes ?? 0) }
+    }
+
+    public func filtered(ignoredKeys: Set<String>) -> SystemDataBreakdown {
+        SystemDataBreakdown(
+            entries: entries,
+            notes: notes,
+            staleItems: staleItems.filter { !ignoredKeys.contains($0.ignoreKey) }
         )
     }
 }

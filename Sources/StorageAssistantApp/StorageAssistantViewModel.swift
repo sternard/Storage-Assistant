@@ -10,6 +10,7 @@ enum ReviewArea: String, CaseIterable, Identifiable, Hashable {
     case developerStorage
     case appLeftovers
     case highRisk
+    case systemData
 
     var id: String { rawValue }
 
@@ -22,6 +23,7 @@ enum ReviewArea: String, CaseIterable, Identifiable, Hashable {
         case .developerStorage: "Developer Storage"
         case .appLeftovers: "App Leftovers & Services"
         case .highRisk: "High Risk Review"
+        case .systemData: "System Data Lens"
         }
     }
 
@@ -34,6 +36,7 @@ enum ReviewArea: String, CaseIterable, Identifiable, Hashable {
         case .developerStorage: "hammer"
         case .appLeftovers: "puzzlepiece.extension"
         case .highRisk: "exclamationmark.triangle"
+        case .systemData: "internaldrive"
         }
     }
 
@@ -58,9 +61,11 @@ enum ReviewArea: String, CaseIterable, Identifiable, Hashable {
                 .buildArtifacts
             ].contains(recommendation.category)
         case .appLeftovers:
-            recommendation.category == .leftovers
+            recommendation.category == .leftovers || recommendation.defaultAction == .commandRecommended
         case .highRisk:
             recommendation.risk == .high
+        case .systemData:
+            false
         }
     }
 }
@@ -95,6 +100,7 @@ final class StorageAssistantViewModel: ObservableObject {
     @Published var ignoredItems: [IgnoredItem]
     @Published var diagnostics: [PermissionDiagnostic] = []
     @Published var growthSummary: GrowthSummary?
+    @Published var systemDataBreakdown: SystemDataBreakdown?
 
     private let stateStore: UserStateStore
     private var ignoredKeys: Set<String>
@@ -125,10 +131,18 @@ final class StorageAssistantViewModel: ObservableObject {
     }
 
     func count(for area: ReviewArea) -> Int {
-        allVisibleRecommendations.filter { area.contains($0) }.count
+        if area == .systemData {
+            return systemDataBreakdown?.entries.count ?? 0
+        }
+
+        return allVisibleRecommendations.filter { area.contains($0) }.count
     }
 
     func bytes(for area: ReviewArea) -> Int64 {
+        if area == .systemData {
+            return systemDataBreakdown?.totalKnownBytes ?? 0
+        }
+
         let items = allVisibleRecommendations.filter { area.contains($0) }
         return items.reduce(0) { $0 + $1.sizeBytes }
     }
@@ -172,6 +186,7 @@ final class StorageAssistantViewModel: ObservableObject {
 
             recommendations = result.recommendations
             diagnostics = result.diagnostics
+            systemDataBreakdown = result.systemDataBreakdown?.filtered(ignoredKeys: ignoredKeys)
             lastScanDate = result.scanDate
             var snapshotSaveError: String?
             do {
@@ -201,6 +216,10 @@ final class StorageAssistantViewModel: ObservableObject {
     func reveal(_ recommendation: Recommendation) {
         let url = URL(fileURLWithPath: recommendation.path)
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func revealSystemDataPath(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     func ignore(_ recommendation: Recommendation) {

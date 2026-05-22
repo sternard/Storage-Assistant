@@ -34,6 +34,9 @@ if jsonOutput {
     print("Scan date: \(visibleResult.scanDate)")
     print("Recommendations: \(visibleResult.recommendations.count)")
     print("Estimated reviewable space: \(StorageFormatting.bytes(visibleResult.totalPotentialBytes))")
+    if let breakdown = visibleResult.systemDataBreakdown {
+        print("Visible System Data lens: \(StorageFormatting.bytes(breakdown.totalKnownBytes)) across \(breakdown.entries.count) locations")
+    }
     print("")
 
     for recommendation in visibleResult.recommendations {
@@ -43,5 +46,27 @@ if jsonOutput {
         print("  Reason: \(recommendation.reason)")
         print("  Action: \(recommendation.defaultAction.title)")
         print("")
+    }
+
+    if let breakdown = visibleResult.systemDataBreakdown, !breakdown.entries.isEmpty {
+        print("System Data Lens")
+        for entry in breakdown.entries.prefix(10) {
+            print("[\(entry.category.title)] \(entry.title)")
+            print("  Size: \(entry.sizeBytes.map(StorageFormatting.bytes) ?? "Unknown")")
+            if let path = entry.path {
+                print("  Path: \(path)")
+            }
+            print("  Detail: \(entry.detail)")
+            if !entry.contributors.isEmpty {
+                let contributors = entry.contributors
+                    .prefix(5)
+                    .map { contributor in
+                        "\(contributor.displayName) \(StorageFormatting.bytes(contributor.sizeBytes))"
+                    }
+                    .joined(separator: ", ")
+                print("  Largest visible contributors: \(contributors)")
+            }
+            print("")
+        }
     }
 }

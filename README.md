@@ -25,6 +25,11 @@ Storage Assistant is a recommendation-first macOS cleanup prototype. It scans us
   - Broader review-only traces in user and system Library locations, including Application Support, Preferences, Logs, Caches, plug-ins, Quick Look generators, Spotlight importers, preference panes, screen savers, privileged helpers, shared support folders, and package receipts.
   - Launch agents and launch daemons that point to missing programs or appear to be running without a matching installed app.
   - Known licensing/service leftovers such as PACE/iLok components.
+- System Data lens:
+  - Visible user Library contributors such as Application Support, sandbox containers, group containers, caches, logs, and developer support data.
+  - Visible system-wide contributors such as `/Library/Application Support`, `/Library/Caches`, `/Library/Logs`, `/Users/Shared`, temporary folders, and virtual memory files.
+  - Stale review-only system/app support items are surfaced as normal App Leftovers & Services recommendations rather than inside the lens.
+  - Local Time Machine snapshot detection when macOS reports snapshots for the startup volume.
 
 High-risk recommendations are review-only. Riskier systems such as Docker's disk image and simulator devices are surfaced so you can inspect them, not deleted directly.
 
@@ -56,7 +61,7 @@ swift run storage-assistant -- --progress
 
 The SwiftUI app can reveal items in Finder, ignore recommendations, and move low/medium-risk recommendations to Trash.
 
-The sidebar groups results into broad review areas rather than one row per tool: Quick Wins, User Files, Caches & Logs, Developer Storage, App Leftovers & Services, and High Risk Review. Individual recommendations still show their more specific detector type.
+The sidebar groups results into broad review areas rather than one row per tool: Quick Wins, User Files, Caches & Logs, Developer Storage, App Leftovers & Services, High Risk Review, and System Data Lens. Individual recommendations still show their more specific detector type.
 
 `swift run StorageAssistantApp` builds the same executable, but SwiftPM does not create a normal `.app` bundle. The helper script wraps the executable in a local app bundle and opens it like a regular macOS app.
 
@@ -75,6 +80,7 @@ The sidebar groups results into broad review areas rather than one row per tool:
 - Permission diagnostics for paths that cannot be fully scanned.
 - Configurable cleanup thresholds.
 - Command suggestions for safer Docker/Xcode cleanup paths.
+- System Data Lens with context, inspect-only contributors, and largest visible child folders.
 
 Run tests with:
 
@@ -86,7 +92,7 @@ swift test
 
 - No background deletion.
 - No permanent deletion.
-- No scanning of `/System`, `/private`, `/bin`, or `/sbin`. System-wide `/Library`, `/Users/Shared`, and package receipt traces are surfaced as review-only.
+- No scanning of `/System`, `/bin`, or `/sbin`. System-wide `/Library`, `/Users/Shared`, selected `/private/var` storage locations, and package receipt traces are surfaced as review-only.
 - Risky developer artifacts are marked review-only when direct deletion would be unsafe.
 - Running services, launch daemons, and privileged helper tools are review-only.
 - Ignore rules and cleanup history are saved locally in `~/Library/Application Support/Storage Assistant/state.json`.

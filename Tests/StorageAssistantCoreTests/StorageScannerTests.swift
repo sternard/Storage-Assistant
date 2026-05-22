@@ -66,6 +66,104 @@ final class StorageScannerTests: XCTestCase {
         XCTAssertEqual(pipRecommendations.first?.category, .python)
     }
 
+    func testSystemDataBreakdownMeasuresVisibleLibraryContributors() throws {
+        let appSupport = temporaryRoot
+            .appendingPathComponent("Library/Application Support/LargeLocalIndex", isDirectory: true)
+        let cache = temporaryRoot
+            .appendingPathComponent("Library/Caches/com.example.Cache", isDirectory: true)
+        try writeFile(at: appSupport.appendingPathComponent("index.bin"), byteCount: 4_096)
+        try writeFile(at: cache.appendingPathComponent("cache.bin"), byteCount: 2_048)
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: tinyConfig()
+        ).scan()
+
+        let breakdown = try XCTUnwrap(result.systemDataBreakdown)
+        XCTAssertGreaterThan(breakdown.totalKnownBytes, 0)
+
+        let appSupportEntry = try XCTUnwrap(
+            breakdown.entries.first { samePath($0.path ?? "", appSupport.deletingLastPathComponent().path) }
+        )
+        XCTAssertEqual(appSupportEntry.category, .userLibrary)
+        XCTAssertTrue(
+            appSupportEntry.contributors.contains {
+                samePath($0.path, appSupport.path)
+            }
+        )
+
+        let cacheRecommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, cache.path)
+            }
+        )
+        XCTAssertTrue(cacheRecommendation.canMoveToTrash)
+        XCTAssertEqual(cacheRecommendation.category, .caches)
+        XCTAssertTrue(breakdown.staleItems.isEmpty)
+    }
+
+    func testSystemDataReviewItemsBecomeLeftoverRecommendations() throws {
+        let appSupport = temporaryRoot
+            .appendingPathComponent("Library/Application Support/com.example.StaleSupport", isDirectory: true)
+        try writeFile(
+            at: appSupport.appendingPathComponent("state.bin"),
+            byteCount: 11 * 1_024 * 1_024
+        )
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, appSupport.path)
+            }
+        )
+        XCTAssertEqual(recommendation.category, .leftovers)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+        XCTAssertTrue(result.systemDataBreakdown?.staleItems.isEmpty ?? false)
+    }
+
+    func testDirectoryAgeUsesDescendantActivityForCachesAndSystemData() throws {
+        let now = Date()
+        let oldDate = now.addingTimeInterval(-400 * 24 * 60 * 60)
+        let recentDate = now.addingTimeInterval(-60)
+        let cache = temporaryRoot
+            .appendingPathComponent("Library/Caches/com.example.ActiveCache", isDirectory: true)
+        let nested = cache.appendingPathComponent("Nested", isDirectory: true)
+        let activeFile = nested.appendingPathComponent("today.bin")
+
+        try writeFile(at: activeFile, byteCount: 4_096)
+        try setModificationDate(recentDate, for: activeFile)
+        try setModificationDate(oldDate, for: nested)
+        try setModificationDate(oldDate, for: cache)
+
+        var config = tinyConfig()
+        config.oldCacheDays = 30
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config,
+            now: now
+        ).scan()
+
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, cache.path) && $0.category == .caches
+            }
+        )
+        XCTAssertFalse(
+            result.systemDataBreakdown?.staleItems.contains {
+                samePath($0.path, cache.path)
+            } ?? false
+        )
+    }
+
     func testDownloadDiskImagesAreReviewableAndTrashable() throws {
         let download = temporaryRoot.appendingPathComponent("Downloads/OldInstaller.dmg")
         try writeFile(at: download, byteCount: 4_096)
@@ -234,6 +332,84 @@ final class StorageScannerTests: XCTestCase {
 
         XCTAssertEqual(recommendation.confidence, .low)
         XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+    }
+
+    func testFlagsNestedStaleApplicationSupportFolderUnderActiveVendorFolder() throws {
+        let now = Date()
+        let oldDate = now.addingTimeInterval(-400 * 24 * 60 * 60)
+        let recentDate = now.addingTimeInterval(-60)
+        let vendor = temporaryRoot
+            .appendingPathComponent("Library/Application Support/Acme", isDirectory: true)
+        let retiredAppSupport = vendor.appendingPathComponent("Retired Sketch", isDirectory: true)
+        let activeAppSupport = vendor.appendingPathComponent("Current Painter", isDirectory: true)
+        let retiredFile = retiredAppSupport.appendingPathComponent("state.db")
+        let activeFile = activeAppSupport.appendingPathComponent("state.db")
+
+        try writeFile(at: retiredFile, byteCount: 4_096)
+        try writeFile(at: activeFile, byteCount: 4_096)
+        try setActivityDate(oldDate, for: retiredFile)
+        try setActivityDate(oldDate, for: retiredAppSupport)
+        try setActivityDate(recentDate, for: activeFile)
+        try setActivityDate(recentDate, for: activeAppSupport)
+        try setActivityDate(oldDate, for: vendor)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.leftoverStaleDays = 90
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config,
+            now: now
+        ).scan()
+
+        let recommendation = try XCTUnwrap(
+            result.recommendations.first {
+                samePath($0.path, retiredAppSupport.path) && $0.category == .leftovers
+            }
+        )
+
+        XCTAssertEqual(recommendation.confidence, .low)
+        XCTAssertEqual(recommendation.defaultAction, .revealOnly)
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, activeAppSupport.path) && $0.category == .leftovers
+            }
+        )
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, vendor.path) && $0.category == .leftovers
+            }
+        )
+    }
+
+    func testDoesNotFlagNestedApplicationSupportFolderForInstalledAppName() throws {
+        let app = temporaryRoot.appendingPathComponent("Applications/Retired Sketch.app", isDirectory: true)
+        try createAppBundle(
+            at: app,
+            bundleIdentifier: "com.example.RetiredSketch",
+            name: "Retired Sketch"
+        )
+
+        let nestedAppSupport = temporaryRoot
+            .appendingPathComponent("Library/Application Support/Acme/Retired Sketch", isDirectory: true)
+        try writeFile(at: nestedAppSupport.appendingPathComponent("state.db"), byteCount: 4_096)
+
+        var config = tinyConfig()
+        config.enableAppLeftoverScan = true
+        config.installedAppSearchRoots = [temporaryRoot.appendingPathComponent("Applications", isDirectory: true)]
+
+        let result = StorageScanner(
+            homeDirectory: temporaryRoot,
+            config: config
+        ).scan()
+
+        XCTAssertFalse(
+            result.recommendations.contains {
+                samePath($0.path, nestedAppSupport.path) && $0.category == .leftovers
+            }
+        )
     }
 
     func testFlagsHiddenConfigurationFolderForUninstalledApp() throws {
@@ -440,6 +616,35 @@ final class StorageScannerTests: XCTestCase {
         )
         let data = Data(repeating: 0x1, count: byteCount)
         try data.write(to: url)
+    }
+
+    private func setModificationDate(_ date: Date, for url: URL) throws {
+        try FileManager.default.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: url.path
+        )
+    }
+
+    private func setActivityDate(_ date: Date, for url: URL) throws {
+        try FileManager.default.setAttributes(
+            [
+                .creationDate: date,
+                .modificationDate: date
+            ],
+            ofItemAtPath: url.path
+        )
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMddHHmm.ss"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/touch")
+        process.arguments = ["-amt", formatter.string(from: date), url.path]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
     }
 
     private func samePath(_ lhs: String, _ rhs: String) -> Bool {
